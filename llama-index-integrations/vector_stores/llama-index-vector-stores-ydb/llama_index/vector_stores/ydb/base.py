@@ -31,8 +31,14 @@ DEFAULT_BATCH_SIZE = 100
 DEFAULT_INDEX_NAME = "llamaindex_vector_index"
 DEFAULT_INDEX_LEVELS = 2
 DEFAULT_INDEX_CLUSTERS = 128
-DEFAULT_INDEX_TREE_SEARCH_TOP_SIZE = 1
+# None: do not emit the PRAGMA, so the server default applies
+# (per the YDB docs: 4 with overlapping clusters, 10 without overlap).
+DEFAULT_INDEX_TREE_SEARCH_TOP_SIZE: Optional[int] = None
 DEFAULT_INDEX_READY_TIMEOUT = 3600.0
+
+_INDEX_READY = "ready"  # the final index already exists
+_INDEX_FINISH_TEMP = "finish_temp"  # only the temporary index exists (leftover)
+_INDEX_BUILD = "build"  # nothing exists yet
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FLOAT_VECTOR_TAG = b"\x01"  # last byte of a YDB binary vector: 1 = Float
@@ -213,6 +219,15 @@ def _rename_item(temp_name: str, final_name: str) -> Any:
     )
 
 
+def _plan_index_setup(indexes: Sequence[Any], final_name: str, temp_name: str) -> str:
+    """Decide what lazy index creation has to do, given the table's current indexes."""
+    if _find_index(indexes, final_name) is not None:
+        return _INDEX_READY
+    if _find_index(indexes, temp_name) is not None:
+        return _INDEX_FINISH_TEMP
+    return _INDEX_BUILD
+
+
 class YDBVectorStore(BasePydanticVectorStore):
     """
     Vector store backed by YDB.
@@ -254,7 +269,7 @@ class YDBVectorStore(BasePydanticVectorStore):
     index_name: str
     index_config_levels: int
     index_config_clusters: int
-    index_tree_search_top_size: int
+    index_tree_search_top_size: Optional[int]
     credentials: Any = Field(default=None, exclude=True)
 
     _connection: Any = PrivateAttr(default=None)
@@ -282,7 +297,10 @@ class YDBVectorStore(BasePydanticVectorStore):
         index_name: str = DEFAULT_INDEX_NAME,
         index_config_levels: int = DEFAULT_INDEX_LEVELS,
         index_config_clusters: int = DEFAULT_INDEX_CLUSTERS,
-        index_tree_search_top_size: int = DEFAULT_INDEX_TREE_SEARCH_TOP_SIZE,
+        index_tree_search_top_size: Optional[int] = DEFAULT_INDEX_TREE_SEARCH_TOP_SIZE,
+        stores_text: bool = True,
+        is_embedding_query: bool = True,
+        flat_metadata: bool = False,
     ) -> None:
         """
         Args:
@@ -301,8 +319,16 @@ class YDBVectorStore(BasePydanticVectorStore):
             index_name: name of the vector index.
             index_config_levels: number of tree levels (1-3 recommended).
             index_config_clusters: number of k-means clusters (64-512 recommended).
-            index_tree_search_top_size: search completeness with the index
-                (higher is more accurate and slower).
+            index_tree_search_top_size: how many clusters nearest to the query are
+                scanned at each level of the index (higher: better recall, more reads).
+                None (default) does not emit the PRAGMA, so the server default applies
+                (4 with overlapping clusters, 10 without overlap). Set it explicitly
+                after measuring recall on your data.
+            stores_text / is_embedding_query / flat_metadata: base model fields.
+                They exist so that ``from_dict(store.to_dict())`` works; leave the
+                defaults when creating a store by hand. ``credentials`` are never
+                serialized: pass them again, e.g.
+                ``YDBVectorStore.from_dict(data, credentials=...)``.
 
         """
         _validate_identifier(table_name, "table_name")
@@ -311,7 +337,8 @@ class YDBVectorStore(BasePydanticVectorStore):
         _positive_int(batch_size, "batch_size")
         _positive_int(index_config_levels, "index_config_levels")
         _positive_int(index_config_clusters, "index_config_clusters")
-        _positive_int(index_tree_search_top_size, "index_tree_search_top_size")
+        if index_tree_search_top_size is not None:
+            _positive_int(index_tree_search_top_size, "index_tree_search_top_size")
         try:
             strategy = YDBSearchStrategy(strategy)
         except ValueError:
@@ -335,6 +362,9 @@ class YDBVectorStore(BasePydanticVectorStore):
             index_config_levels=index_config_levels,
             index_config_clusters=index_config_clusters,
             index_tree_search_top_size=index_tree_search_top_size,
+            stores_text=stores_text,
+            is_embedding_query=is_embedding_query,
+            flat_metadata=flat_metadata,
         )
 
         self._aconnection_lock = asyncio.Lock()
@@ -407,7 +437,8 @@ FROM AS_TABLE($rows);
         pragma = ""
         view = ""
         if self.index_enabled:
-            pragma = f'PRAGMA ydb.KMeansTreeSearchTopSize="{self.index_tree_search_top_size}";\n'
+            if self.index_tree_search_top_size is not None:
+                pragma = f'PRAGMA ydb.KMeansTreeSearchTopSize="{self.index_tree_search_top_size}";\n'
             view = f" VIEW `{self.index_name}`"
         order = _strategy_sort_order(self.strategy)
         return f"""{pragma}
@@ -647,6 +678,29 @@ WITH (
         """Execute a statement on the async connection."""
         return await self._arun(await self._aget_connection(), query, params, ddl)
 
+    def _driver_endpoint(self) -> str:
+        """Endpoint of the separate ydb.Driver used for index management."""
+        return f"{'grpcs' if self.secure else 'grpc'}://{self.host}:{self.port}"
+
+    def _driver_credentials(self, connection: Any) -> Any:
+        """
+        Credentials in the form ydb.Driver accepts.
+
+        ydb_dbapi turns a credentials dict into a credentials object for its own
+        driver, so reuse that object instead of passing the raw dict to ydb.Driver.
+        """
+        driver = getattr(connection, "_driver", None)
+        config = getattr(driver, "_driver_config", None)
+        credentials = getattr(config, "credentials", None)
+        if credentials is not None:
+            return credentials
+        if isinstance(self.credentials, dict):
+            raise RuntimeError(
+                "Cannot get normalized credentials from the ydb_dbapi connection; "
+                "pass a ydb.Credentials object instead of a dict"
+            )
+        return self.credentials
+
     def _ensure_vector_index(self) -> bool:
         """
         Create the vector index lazily on the first indexed query.
@@ -660,30 +714,81 @@ WITH (
         if not self.index_enabled or self._index_ready:
             return index_created
 
+        driver = None
         with self._index_setup_lock:
             if self._index_ready:
                 return index_created
 
-            self._execute(self._add_vector_index_query(), ddl=True)
-
-            driver = ydb.Driver(
-                endpoint=f"{'grpcs' if self.secure else 'grpc'}://{self.host}:{self.port}",
-                database=self.database,
-                credentials=self.credentials,
-            )
+            driver = None
             try:
-                driver.wait(timeout=10, fail_fast=True)
-                driver.table_client.alter_table(
-                    self._table_path(),
-                    rename_indexes=[
-                        _rename_item(self._temp_index_name, self.index_name)
-                    ],
+                connection = self._get_connection()
+                endpoint = self._driver_endpoint()
+                logger.debug(
+                    "Opening a ydb driver at %s to manage the vector index", endpoint
                 )
-                index_created = True
+                driver = ydb.Driver(
+                    endpoint=endpoint,
+                    database=self.database,
+                    credentials=self._driver_credentials(connection),
+                )
+                driver.wait(timeout=10, fail_fast=True)
+                path = self._table_path()
+                rename = [_rename_item(self._temp_index_name, self.index_name)]
+                action = _plan_index_setup(
+                    driver.table_client.describe_table(path).indexes,
+                    self.index_name,
+                    self._temp_index_name,
+                )
+                if action == _INDEX_READY:
+                    logger.info(
+                        "Vector index %s already exists; nothing to build",
+                        self.index_name,
+                    )
+                elif action == _INDEX_BUILD:
+                    logger.info(
+                        "No vector index found on %s; building it as %s",
+                        path,
+                        self._temp_index_name,
+                    )
+                    self._execute(self._add_vector_index_query(), ddl=True)
+                    logger.info(
+                        "Index %s is built; renaming it to %s",
+                        self._temp_index_name,
+                        self.index_name,
+                    )
+                    driver.table_client.alter_table(path, rename_indexes=rename)
+                    index_created = True
+                elif action == _INDEX_FINISH_TEMP:
+                    logger.warning(
+                        "Found leftover temporary index %s; renaming it to %s",
+                        self._temp_index_name,
+                        self.index_name,
+                    )
+                    try:
+                        driver.table_client.alter_table(path, rename_indexes=rename)
+                    except Exception:
+                        logger.warning(
+                            "Could not rename leftover index %s; dropping it once, "
+                            "the next query will build the index from scratch",
+                            self._temp_index_name,
+                            exc_info=True,
+                        )
+                        self._execute(self._drop_temp_index_query(), ddl=True)
+                        raise
+                    index_created = True
+            except Exception:
+                logger.error(
+                    "Vector index %s setup failed; the next query will retry "
+                    "from the current state of the table",
+                    self.index_name,
+                )
+                raise
             finally:
-                driver.stop()
+                if driver is not None:
+                    driver.stop()
             self._index_ready = True
-            logger.info("Vector index %s created", self.index_name)
+            if index_created:
+                logger.info("Vector index %s created", self.index_name)
             return index_created
 
     async def _aensure_vector_index(self) -> bool:
@@ -696,25 +801,78 @@ WITH (
             if self._index_ready:
                 return index_created
 
-            await self._aexecute(self._add_vector_index_query(), ddl=True)
-            driver = ydb.aio.Driver(
-                endpoint=f"{'grpcs' if self.secure else 'grpc'}://{self.host}:{self.port}",
-                database=self.database,
-                credentials=self.credentials,
-            )
+            driver = None
             try:
-                await driver.wait(timeout=10, fail_fast=True)
-                await driver.table_client.alter_table(
-                    self._table_path(),
-                    rename_indexes=[
-                        _rename_item(self._temp_index_name, self.index_name)
-                    ],
+                connection = await self._aget_connection()
+                endpoint = self._driver_endpoint()
+                logger.debug(
+                    "Opening a ydb driver at %s to manage the vector index", endpoint
                 )
-                index_created = True
+                driver = ydb.aio.Driver(
+                    endpoint=endpoint,
+                    database=self.database,
+                    credentials=self._driver_credentials(connection),
+                )
+                await driver.wait(timeout=10, fail_fast=True)
+                path = self._table_path()
+                rename = [_rename_item(self._temp_index_name, self.index_name)]
+                description = await driver.table_client.describe_table(path)
+                indexes = description.indexes
+                action = _plan_index_setup(
+                    indexes, self.index_name, self._temp_index_name
+                )
+                if action == _INDEX_READY:
+                    logger.info(
+                        "Vector index %s already exists; nothing to build",
+                        self.index_name,
+                    )
+                elif action == _INDEX_BUILD:
+                    logger.info(
+                        "No vector index found on %s; building it as %s",
+                        path,
+                        self._temp_index_name,
+                    )
+                    await self._aexecute(self._add_vector_index_query(), ddl=True)
+                    logger.info(
+                        "Index %s is built; renaming it to %s",
+                        self._temp_index_name,
+                        self.index_name,
+                    )
+                    await driver.table_client.alter_table(path, rename_indexes=rename)
+                    index_created = True
+                elif action == _INDEX_FINISH_TEMP:
+                    logger.warning(
+                        "Found leftover temporary index %s; renaming it to %s",
+                        self._temp_index_name,
+                        self.index_name,
+                    )
+                    try:
+                        await driver.table_client.alter_table(
+                            path, rename_indexes=rename
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Could not rename leftover index %s; dropping it once, "
+                            "the next query will build the index from scratch",
+                            self._temp_index_name,
+                            exc_info=True,
+                        )
+                        await self._aexecute(self._drop_temp_index_query(), ddl=True)
+                        raise
+                    index_created = True
+            except Exception:
+                logger.error(
+                    "Vector index %s setup failed; the next query will retry "
+                    "from the current state of the table",
+                    self.index_name,
+                )
+                raise
             finally:
-                await driver.stop()
+                if driver is not None:
+                    await driver.stop()
             self._index_ready = True
-            logger.info("Vector index %s created", self.index_name)
+            if index_created:
+                logger.info("Vector index %s created", self.index_name)
 
             return index_created
 

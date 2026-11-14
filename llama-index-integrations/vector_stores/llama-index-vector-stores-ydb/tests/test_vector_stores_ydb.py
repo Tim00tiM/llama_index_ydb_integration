@@ -10,9 +10,11 @@ variables YDB_HOST, YDB_PORT, YDB_DATABASE.
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -44,9 +46,10 @@ YDB_DATABASE = os.environ.get("YDB_DATABASE", "/local")
 
 
 def _offline_store(**kwargs: Any) -> YDBVectorStore:
-    """The constructor does not connect, so this works without YDB."""
+    """perform_setup=False: the constructor does not connect, so this works without YDB."""
     kwargs.setdefault("table_name", "t_offline")
     kwargs.setdefault("embed_dim", 3)
+    kwargs.setdefault("perform_setup", False)
     return YDBVectorStore(**kwargs)
 
 
@@ -67,7 +70,9 @@ def test_connection_is_lazy():
 
 
 def test_from_params_matches_constructor():
-    store = YDBVectorStore.from_params(table_name="t_params", embed_dim=5)
+    store = YDBVectorStore.from_params(
+        table_name="t_params", embed_dim=5, perform_setup=False
+    )
     assert store.table_name == "t_params"
     assert store.embed_dim == 5
 
@@ -443,6 +448,347 @@ def test_empty_add_and_delete_nodes_do_not_connect():
     assert store.add([]) == []
     store.delete_nodes(node_ids=[])
     assert store.client is None
+
+
+# ---- serialization ---------------------------------------------------------
+
+
+def test_to_dict_from_dict_roundtrip():
+    store = _offline_store(
+        table_name="t_ser",
+        embed_dim=8,
+        index_enabled=True,
+        index_name="idx_ser",
+        index_tree_search_top_size=3,
+        strategy=YDBSearchStrategy.COSINE_DISTANCE,
+    )
+    data = store.to_dict()
+    assert "credentials" not in data  # secrets are never serialized
+
+    restored = YDBVectorStore.from_dict(data)
+    assert restored.to_dict() == data
+    assert restored.strategy is YDBSearchStrategy.COSINE_DISTANCE
+    assert restored.index_tree_search_top_size == 3
+
+
+def test_from_dict_accepts_credentials_as_kwarg():
+    creds = {"token": "secret"}
+    restored = YDBVectorStore.from_dict(_offline_store().to_dict(), credentials=creds)
+    assert restored.credentials is creds
+
+
+# ---- index search tuning ---------------------------------------------------
+
+
+def test_default_search_top_size_does_not_emit_pragma():
+    store = _offline_store(index_enabled=True, index_name="idx")
+    assert store.index_tree_search_top_size is None
+    query = store._search_query(3)
+    assert "VIEW `idx`" in query
+    assert "PRAGMA" not in query
+
+
+# ---- credentials for the index-management driver ----------------------------
+
+
+def _connection_with_credentials(credentials: Any) -> Any:
+    driver = SimpleNamespace(_driver_config=SimpleNamespace(credentials=credentials))
+    return SimpleNamespace(_driver=driver)
+
+
+def test_driver_credentials_prefers_normalized_connection_credentials():
+    normalized = object()
+    store = _offline_store(credentials={"token": "secret"})
+    assert (
+        store._driver_credentials(_connection_with_credentials(normalized))
+        is normalized
+    )
+
+
+def test_driver_credentials_rejects_raw_dict_without_normalized_object():
+    store = _offline_store(credentials={"token": "secret"})
+    with pytest.raises(RuntimeError, match="normalized credentials"):
+        store._driver_credentials(_connection_with_credentials(None))
+
+
+def test_driver_credentials_anonymous_stays_none():
+    store = _offline_store()
+    assert store._driver_credentials(_connection_with_credentials(None)) is None
+
+
+# ---- index setup planning ----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("names", "expected"),
+    [
+        ([], "build"),
+        (["other"], "build"),
+        (["idx__temp"], "finish_temp"),
+        (["idx"], "ready"),
+        (["idx", "idx__temp"], "ready"),
+    ],
+)
+def test_plan_index_setup(names, expected):
+    indexes = [SimpleNamespace(name=n) for n in names]
+    assert ydb_base._plan_index_setup(indexes, "idx", "idx__temp") == expected
+
+
+# ---- lazy index creation with fakes ------------------------------------------
+
+_FINAL, _TEMP = "idx", "idx__temp"
+_NORMALIZED = object()
+
+
+class _IndexWorld:
+    """Index list of one table plus a log of the DDL the store ran."""
+
+    def __init__(self, *indexes: str) -> None:
+        self.indexes = list(indexes)
+        self.ddl: list = []
+        self.rename_failures = 0
+        self.driver_fails = False
+        self.driver_credentials: Any = None
+
+    def apply_ddl(self, query: str) -> None:
+        if "ADD INDEX" in query:
+            self.ddl.append("ADD")
+            self.indexes.append(_TEMP)
+        elif "DROP INDEX" in query:
+            self.ddl.append("DROP")
+            self.indexes.remove(_TEMP)
+
+    def rename(self, items: Any) -> None:
+        if self.rename_failures:
+            self.rename_failures -= 1
+            raise RuntimeError("rename failed")
+        for item in items:
+            self.indexes.remove(item.source_name)
+            if item.destination_name in self.indexes:
+                self.indexes.remove(item.destination_name)
+            self.indexes.append(item.destination_name)
+
+    def describe(self) -> Any:
+        return SimpleNamespace(indexes=[SimpleNamespace(name=n) for n in self.indexes])
+
+
+class _Cursor:
+    description = None
+
+    def __init__(self, world: _IndexWorld) -> None:
+        self._world = world
+
+    def __enter__(self) -> "_Cursor":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def execute_scheme(self, query: str, params: Any = None) -> None:
+        self._world.apply_ddl(query)
+
+
+class _AsyncCursor:
+    description = None
+
+    def __init__(self, world: _IndexWorld) -> None:
+        self._world = world
+
+    async def __aenter__(self) -> "_AsyncCursor":
+        return self
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
+
+    async def execute_scheme(self, query: str, params: Any = None) -> None:
+        self._world.apply_ddl(query)
+
+
+class _Connection:
+    def __init__(self, world: _IndexWorld, asynchronous: bool = False) -> None:
+        self._world = world
+        self._asynchronous = asynchronous
+        self._driver = SimpleNamespace(
+            _driver_config=SimpleNamespace(credentials=_NORMALIZED)
+        )
+
+    def cursor(self) -> Any:
+        return (_AsyncCursor if self._asynchronous else _Cursor)(self._world)
+
+    def close(self) -> None:
+        pass
+
+
+class _Driver:
+    world: _IndexWorld
+
+    def __init__(self, endpoint: str, database: str, credentials: Any) -> None:
+        if self.world.driver_fails:
+            raise RuntimeError("driver creation failed")
+        self.world.driver_credentials = credentials
+        self.table_client = SimpleNamespace(
+            describe_table=lambda path: self.world.describe(),
+            alter_table=lambda path, rename_indexes: self.world.rename(rename_indexes),
+        )
+
+    def wait(self, **kwargs: Any) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+
+class _AsyncDriver:
+    world: _IndexWorld
+
+    def __init__(self, endpoint: str, database: str, credentials: Any) -> None:
+        if self.world.driver_fails:
+            raise RuntimeError("driver creation failed")
+        self.world.driver_credentials = credentials
+
+        async def describe_table(path: str) -> Any:
+            return self.world.describe()
+
+        async def alter_table(path: str, rename_indexes: Any) -> None:
+            self.world.rename(rename_indexes)
+
+        self.table_client = SimpleNamespace(
+            describe_table=describe_table, alter_table=alter_table
+        )
+
+    async def wait(self, **kwargs: Any) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+
+def _setup_world(monkeypatch: Any, world: _IndexWorld) -> YDBVectorStore:
+    """A store wired to fake connections and drivers that share ``world``."""
+    _Driver.world = world
+    _AsyncDriver.world = world
+    monkeypatch.setattr(ydb_base.ydb, "Driver", _Driver)
+    monkeypatch.setattr(ydb_base.ydb.aio, "Driver", _AsyncDriver)
+    store = _offline_store(
+        index_enabled=True, index_name=_FINAL, credentials={"token": "secret"}
+    )
+    store._connection = _Connection(world)
+    return store
+
+
+def test_ensure_vector_index_builds_missing_index(monkeypatch):
+    world = _IndexWorld()
+    store = _setup_world(monkeypatch, world)
+
+    assert store._ensure_vector_index() is True
+    assert world.ddl == ["ADD"]
+    assert world.indexes == [_FINAL]
+
+
+def test_ensure_vector_index_gives_ydb_driver_normalized_credentials(monkeypatch):
+    world = _IndexWorld()
+    store = _setup_world(monkeypatch, world)  # credentials are a dict
+
+    store._ensure_vector_index()
+    assert world.driver_credentials is _NORMALIZED
+
+
+def test_ensure_vector_index_reuses_existing_index(monkeypatch):
+    world = _IndexWorld(_FINAL)
+    store = _setup_world(monkeypatch, world)
+
+    assert store._ensure_vector_index() is False
+    assert world.ddl == []
+    assert store._index_ready is True
+
+
+def test_ensure_vector_index_finishes_leftover_temp_index(monkeypatch):
+    world = _IndexWorld(_TEMP)
+    store = _setup_world(monkeypatch, world)
+
+    assert store._ensure_vector_index() is True
+    assert world.ddl == []  # renamed, nothing rebuilt
+    assert world.indexes == [_FINAL]
+
+
+def test_ensure_vector_index_retry_after_failure_between_add_and_rename(monkeypatch):
+    world = _IndexWorld()
+    world.rename_failures = 1
+    store = _setup_world(monkeypatch, world)
+
+    with pytest.raises(RuntimeError):
+        store._ensure_vector_index()
+    assert world.indexes == [_TEMP]  # built but not renamed
+
+    assert store._ensure_vector_index() is True
+    assert world.ddl == ["ADD"]  # the retry did not build a second index
+    assert world.indexes == [_FINAL]
+
+
+def test_ensure_vector_index_drops_unrenamable_leftover_once(monkeypatch):
+    world = _IndexWorld(_TEMP)
+    world.rename_failures = 1
+    store = _setup_world(monkeypatch, world)
+
+    with pytest.raises(RuntimeError):
+        store._ensure_vector_index()
+    assert world.ddl == ["DROP"]  # dropped once, not rebuilt in the same call
+    assert world.indexes == []
+    assert store._index_ready is False
+
+    assert store._ensure_vector_index() is True  # the next call builds from scratch
+    assert world.ddl == ["DROP", "ADD"]
+    assert world.indexes == [_FINAL]
+
+
+def test_ensure_vector_index_driver_failure_logs_and_changes_nothing(
+    monkeypatch, caplog
+):
+    world = _IndexWorld()
+    world.driver_fails = True
+    store = _setup_world(monkeypatch, world)
+
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(RuntimeError, match="driver creation failed"):
+            store._ensure_vector_index()
+    assert any("setup failed" in r.getMessage() for r in caplog.records)
+    assert world.ddl == []
+    assert world.indexes == []
+
+    world.driver_fails = False
+    assert store._ensure_vector_index() is True
+
+
+def test_async_ensure_vector_index_builds_with_normalized_credentials(monkeypatch):
+    world = _IndexWorld()
+    store = _setup_world(monkeypatch, world)
+
+    async def run() -> bool:
+        store._aconnection = _Connection(world, asynchronous=True)
+        store._aloop = asyncio.get_running_loop()
+        return await store._aensure_vector_index()
+
+    assert asyncio.run(run()) is True
+    assert world.driver_credentials is _NORMALIZED
+    assert world.indexes == [_FINAL]
+
+
+def test_async_ensure_vector_index_drops_unrenamable_leftover_once(monkeypatch):
+    world = _IndexWorld(_TEMP)
+    world.rename_failures = 1
+    store = _setup_world(monkeypatch, world)
+
+    async def run() -> None:
+        store._aconnection = _Connection(world, asynchronous=True)
+        store._aloop = asyncio.get_running_loop()
+        with pytest.raises(RuntimeError):
+            await store._aensure_vector_index()
+        assert world.ddl == ["DROP"]
+        assert await store._aensure_vector_index() is True
+
+    asyncio.run(run())
+    assert world.ddl == ["DROP", "ADD"]
+    assert world.indexes == [_FINAL]
 
 
 ##########################################
