@@ -5,7 +5,9 @@ import logging
 import re
 import struct
 import threading
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional, Sequence, TypeGuard, Union
 
 import ydb
 import ydb_dbapi
@@ -29,6 +31,7 @@ DEFAULT_TABLE_NAME = "llamaindex_nodes"
 DEFAULT_EMBED_DIM = 1536
 DEFAULT_BATCH_SIZE = 100
 DEFAULT_INDEX_NAME = "llamaindex_vector_index"
+DEFAULT_FULLTEXT_INDEX_NAME = "llamaindex_fulltext_index"
 DEFAULT_INDEX_LEVELS = 2
 DEFAULT_INDEX_CLUSTERS = 128
 # None: do not emit the PRAGMA, so the server default applies
@@ -36,12 +39,10 @@ DEFAULT_INDEX_CLUSTERS = 128
 DEFAULT_INDEX_TREE_SEARCH_TOP_SIZE: Optional[int] = None
 DEFAULT_INDEX_READY_TIMEOUT = 3600.0
 
-_INDEX_READY = "ready"  # the final index already exists
-_INDEX_FINISH_TEMP = "finish_temp"  # only the temporary index exists (leftover)
-_INDEX_BUILD = "build"  # nothing exists yet
-
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FLOAT_VECTOR_TAG = b"\x01"  # last byte of a YDB binary vector: 1 = Float
+# Like PGVectorStore, treat SPARSE as an alias for BM25 full-text search.
+_TEXT_SEARCH_MODES = (VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.SPARSE)
 
 
 class YDBSearchStrategy(str, enum.Enum):
@@ -148,16 +149,21 @@ def _row_to_node(row: Dict[str, Any]) -> BaseNode:
 def _rows_to_result(
     rows: List[Dict[str, Any]],
     strategy: YDBSearchStrategy = DEFAULT_STRATEGY,
+    mode: VectorStoreQueryMode = VectorStoreQueryMode.DEFAULT,
 ) -> VectorStoreQueryResult:
-    """Convert search rows to a query result (score is converted to a similarity)."""
-    nodes: List[BaseNode] = []
-    similarities: List[float] = []
-    ids: List[str] = []
-    for row in rows:
-        nodes.append(_row_to_node(row))
-        similarities.append(_score_to_similarity(strategy, row.get("score")))
-        ids.append(row["node_id"])
-    return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
+    """Preserve YDB's result order and return scores when the query exposes them."""
+    similarities = None
+    if mode == VectorStoreQueryMode.DEFAULT:
+        similarities = [
+            _score_to_similarity(strategy, row.get("score")) for row in rows
+        ]
+    elif mode in _TEXT_SEARCH_MODES:
+        similarities = [float(row["score"]) for row in rows]
+    return VectorStoreQueryResult(
+        nodes=[_row_to_node(row) for row in rows],
+        similarities=similarities,
+        ids=[row["node_id"] for row in rows],
+    )
 
 
 def _rows_to_nodes(
@@ -219,13 +225,12 @@ def _rename_item(temp_name: str, final_name: str) -> Any:
     )
 
 
-def _plan_index_setup(indexes: Sequence[Any], final_name: str, temp_name: str) -> str:
-    """Decide what lazy index creation has to do, given the table's current indexes."""
-    if _find_index(indexes, final_name) is not None:
-        return _INDEX_READY
-    if _find_index(indexes, temp_name) is not None:
-        return _INDEX_FINISH_TEMP
-    return _INDEX_BUILD
+@dataclass(frozen=True)
+class _IndexSetup:
+    name: str
+    add_query: str
+    temporary_name: Optional[str] = None
+    column: Optional[str] = None
 
 
 class YDBVectorStore(BasePydanticVectorStore):
@@ -239,7 +244,9 @@ class YDBVectorStore(BasePydanticVectorStore):
     Async operations on a single YDBVectorStore instance must be executed within the same event loop.
     Do not reuse the instance across separate asyncio.run() calls. Create a new instance for each event loop.
 
-    For now approximate search, metadata filters are not available.
+    Enable ``fulltext_index_enabled`` for BM25 search. Native HybridRank requires
+    ``hybrid_search_enabled``, ``index_enabled``, and ``fulltext_index_enabled``.
+    Metadata filters are not supported yet.
 
     Examples:
         ```python
@@ -270,16 +277,19 @@ class YDBVectorStore(BasePydanticVectorStore):
     index_config_levels: int
     index_config_clusters: int
     index_tree_search_top_size: Optional[int]
+    fulltext_index_enabled: bool
+    fulltext_index_name: str
+    hybrid_search_enabled: bool
     credentials: Any = Field(default=None, exclude=True)
 
     _connection: Any = PrivateAttr(default=None)
     _aloop: Any = PrivateAttr(default=None)
     _aconnection: Any = PrivateAttr(default=None)
-    _aindex_lock: Any = PrivateAttr(default=None)
-    _aconnection_lock: Any = PrivateAttr(default=None)
+    _aindex_setup_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+    _aconnection_lock: Any = PrivateAttr(default_factory=asyncio.Lock)
     _table_ready: bool = PrivateAttr(default=False)
     _index_setup_lock: Any = PrivateAttr(default_factory=threading.Lock)
-    _index_ready: bool = PrivateAttr(default=False)
+    _ready_indexes: set[str] = PrivateAttr(default_factory=set)
 
     def __init__(
         self,
@@ -301,6 +311,9 @@ class YDBVectorStore(BasePydanticVectorStore):
         stores_text: bool = True,
         is_embedding_query: bool = True,
         flat_metadata: bool = False,
+        fulltext_index_enabled: bool = False,
+        fulltext_index_name: str = DEFAULT_FULLTEXT_INDEX_NAME,
+        hybrid_search_enabled: bool = False,
     ) -> None:
         """
         Args:
@@ -324,6 +337,10 @@ class YDBVectorStore(BasePydanticVectorStore):
                 None (default) does not emit the PRAGMA, so the server default applies
                 (4 with overlapping clusters, 10 without overlap). Set it explicitly
                 after measuring recall on your data.
+            fulltext_index_enabled: enable BM25 search with a fulltext index on text.
+            fulltext_index_name: name of the fulltext index.
+            hybrid_search_enabled: enable native HybridRank when both index flags
+                are enabled. Also enables standalone BM25 search.
             stores_text / is_embedding_query / flat_metadata: base model fields.
                 They exist so that ``from_dict(store.to_dict())`` works; leave the
                 defaults when creating a store by hand. ``credentials`` are never
@@ -333,6 +350,14 @@ class YDBVectorStore(BasePydanticVectorStore):
         """
         _validate_identifier(table_name, "table_name")
         _validate_identifier(index_name, "index_name")
+        _validate_identifier(fulltext_index_name, "fulltext_index_name")
+        if (
+            fulltext_index_enabled or hybrid_search_enabled
+        ) and fulltext_index_name in (
+            index_name,
+            f"{index_name}__temp",
+        ):
+            raise ValueError("Fulltext and vector index names must be distinct")
         _positive_int(embed_dim, "embed_dim")
         _positive_int(batch_size, "batch_size")
         _positive_int(index_config_levels, "index_config_levels")
@@ -362,13 +387,13 @@ class YDBVectorStore(BasePydanticVectorStore):
             index_config_levels=index_config_levels,
             index_config_clusters=index_config_clusters,
             index_tree_search_top_size=index_tree_search_top_size,
+            fulltext_index_enabled=fulltext_index_enabled,
+            fulltext_index_name=fulltext_index_name,
+            hybrid_search_enabled=hybrid_search_enabled,
             stores_text=stores_text,
             is_embedding_query=is_embedding_query,
             flat_metadata=flat_metadata,
         )
-
-        self._aconnection_lock = asyncio.Lock()
-        self._aindex_lock = asyncio.Lock()
 
         if self.perform_setup:
             self._setup()
@@ -437,8 +462,7 @@ FROM AS_TABLE($rows);
         pragma = ""
         view = ""
         if self.index_enabled:
-            if self.index_tree_search_top_size is not None:
-                pragma = f'PRAGMA ydb.KMeansTreeSearchTopSize="{self.index_tree_search_top_size}";\n'
+            pragma = self._vector_search_pragma()
             view = f" VIEW `{self.index_name}`"
         order = _strategy_sort_order(self.strategy)
         return f"""{pragma}
@@ -451,6 +475,44 @@ SELECT
     Knn::{self.strategy.value}(`embedding`, $embedding) AS score
 FROM `{self.table_name}`{view}
 ORDER BY score {order}
+LIMIT {top_k};
+"""
+
+    def _vector_search_pragma(self) -> str:
+        if self.index_tree_search_top_size is None:
+            return ""
+        return (
+            f'PRAGMA ydb.KMeansTreeSearchTopSize="{self.index_tree_search_top_size}";\n'
+        )
+
+    def _fulltext_search_query(self, top_k: int) -> str:
+        score = "FulltextScore(`text`, $query_text)"
+        return f"""
+DECLARE $query_text AS Utf8;
+
+SELECT `node_id`, `text`, `metadata`, {score} AS score
+FROM `{self.table_name}` VIEW `{self.fulltext_index_name}`
+WHERE {score} > 0
+ORDER BY score DESC
+LIMIT {top_k};
+"""
+
+    def _hybrid_search_query(
+        self, top_k: int, text_top_k: int, vector_top_k: int, alpha: float
+    ) -> str:
+        return f"""{self._vector_search_pragma()}
+DECLARE $query_text AS Utf8;
+DECLARE $embedding AS String;
+
+SELECT `node_id`, `text`, `metadata`
+FROM `{self.table_name}`
+ORDER BY HybridRank(
+    FullTextScore(`text`, $query_text),
+    Knn::{self.strategy.value}(`embedding`, $embedding),
+    ({1.0 - alpha}, {alpha}) AS Weights,
+    ("{self.fulltext_index_name}", "{self.index_name}") AS Indexes,
+    ({text_top_k}, {vector_top_k}) AS Limits
+)
 LIMIT {top_k};
 """
 
@@ -507,6 +569,15 @@ WITH (
 );
 """
 
+    def _add_fulltext_index_query(self) -> str:
+        return f"""
+ALTER TABLE `{self.table_name}`
+ADD INDEX `{self.fulltext_index_name}`
+GLOBAL USING fulltext_relevance
+ON (`text`)
+WITH (tokenizer=standard, use_filter_lowercase=true);
+"""
+
     def _drop_temp_index_query(self) -> str:
         """Build the DDL that drops a leftover temporary index."""
         return f"ALTER TABLE `{self.table_name}` DROP INDEX `{self._temp_index_name}`;"
@@ -552,28 +623,83 @@ WITH (
 
     def _prepare_search(self, query: VectorStoreQuery) -> tuple:
         """Validate a query and return its YQL statement and parameters."""
-        if query.mode != VectorStoreQueryMode.DEFAULT:
+        text_search = query.mode in _TEXT_SEARCH_MODES
+        hybrid_search = query.mode == VectorStoreQueryMode.HYBRID
+        if not (
+            text_search or hybrid_search or query.mode == VectorStoreQueryMode.DEFAULT
+        ):
             raise NotImplementedError(
-                f"YDBVectorStore supports only VectorStoreQueryMode.DEFAULT, got {query.mode}"
+                f"YDBVectorStore does not support query mode {query.mode}"
             )
-        if query.query_embedding is None:
-            raise ValueError("query_embedding is required for a DEFAULT query")
-        if len(query.query_embedding) != self.embed_dim:
+        if hybrid_search:
+            if not self.hybrid_search_enabled:
+                raise ValueError("Set hybrid_search_enabled=True to use hybrid search")
+            if not (self.index_enabled and self.fulltext_index_enabled):
+                raise ValueError(
+                    "Hybrid search requires index_enabled=True and "
+                    "fulltext_index_enabled=True"
+                )
+        if text_search and not (
+            self.fulltext_index_enabled or self.hybrid_search_enabled
+        ):
             raise ValueError(
-                f"query_embedding has {len(query.query_embedding)} dimensions, "
-                f"but the store is configured with embed_dim={self.embed_dim}"
+                "Set fulltext_index_enabled=True or hybrid_search_enabled=True "
+                "to use fulltext search"
             )
-        if query.filters is not None:
-            raise NotImplementedError("Metadata filters are not supported yet")
+        self._reject_filters(query.filters)
         # NOTE: LlamaIndex passes node_ids=[] meaning "no restriction", so check truthiness
         if query.node_ids or query.doc_ids:
             raise NotImplementedError(
                 "node_ids / doc_ids in queries are not supported yet"
             )
-        return (
-            self._search_query(query.similarity_top_k),
-            self._search_params(query.query_embedding),
-        )
+
+        params = {}
+        if text_search or hybrid_search:
+            if not isinstance(query.query_str, str) or not query.query_str.strip():
+                raise ValueError(
+                    "query_str must contain text for text or hybrid search"
+                )
+            params["$query_text"] = (query.query_str, ydb.PrimitiveType.Utf8)
+
+        if not text_search:
+            if query.query_embedding is None:
+                raise ValueError(
+                    "query_embedding is required for vector or hybrid search"
+                )
+            if len(query.query_embedding) != self.embed_dim:
+                raise ValueError(
+                    f"query_embedding has {len(query.query_embedding)} dimensions, "
+                    f"but the store is configured with embed_dim={self.embed_dim}"
+                )
+            params.update(self._search_params(query.query_embedding))
+
+        if text_search or hybrid_search:
+            sparse_top_k = query.sparse_top_k
+            if sparse_top_k is None:
+                sparse_top_k = query.similarity_top_k
+                _positive_int(sparse_top_k, "similarity_top_k")
+            else:
+                _positive_int(sparse_top_k, "sparse_top_k")
+            if text_search:
+                return self._fulltext_search_query(sparse_top_k), params
+
+            vector_top_k = _positive_int(query.similarity_top_k, "similarity_top_k")
+            hybrid_top_k = (
+                vector_top_k
+                if query.hybrid_top_k is None
+                else _positive_int(query.hybrid_top_k, "hybrid_top_k")
+            )
+            alpha = 0.5 if query.alpha is None else query.alpha
+            if not isinstance(alpha, (int, float)) or not 0.0 <= alpha <= 1.0:
+                raise ValueError("alpha must be between 0 and 1")
+            return (
+                self._hybrid_search_query(
+                    hybrid_top_k, sparse_top_k, vector_top_k, alpha
+                ),
+                params,
+            )
+
+        return self._search_query(query.similarity_top_k), params
 
     @staticmethod
     def _reject_filters(filters: Optional[MetadataFilters]) -> None:
@@ -678,203 +804,208 @@ WITH (
         """Execute a statement on the async connection."""
         return await self._arun(await self._aget_connection(), query, params, ddl)
 
-    def _driver_endpoint(self) -> str:
-        """Endpoint of the separate ydb.Driver used for index management."""
-        return f"{'grpcs' if self.secure else 'grpc'}://{self.host}:{self.port}"
+    def _vector_index_setup(self) -> _IndexSetup:
+        return _IndexSetup(
+            self.index_name, self._add_vector_index_query(), self._temp_index_name
+        )
 
-    def _driver_credentials(self, connection: Any) -> Any:
-        """
-        Credentials in the form ydb.Driver accepts.
-
-        ydb_dbapi turns a credentials dict into a credentials object for its own
-        driver, so reuse that object instead of passing the raw dict to ydb.Driver.
-        """
-        driver = getattr(connection, "_driver", None)
-        config = getattr(driver, "_driver_config", None)
-        credentials = getattr(config, "credentials", None)
-        if credentials is not None:
-            return credentials
-        if isinstance(self.credentials, dict):
-            raise RuntimeError(
-                "Cannot get normalized credentials from the ydb_dbapi connection; "
-                "pass a ydb.Credentials object instead of a dict"
-            )
-        return self.credentials
+    def _fulltext_index_setup(self) -> _IndexSetup:
+        return _IndexSetup(
+            self.fulltext_index_name, self._add_fulltext_index_query(), column="text"
+        )
 
     def _ensure_vector_index(self) -> bool:
-        """
-        Create the vector index lazily on the first indexed query.
-
-        Index creation is intentionally deferred until query time so that the
-        index is built after the initial data load, not on an empty table.
-
-        Return result shows if index was created by this call.
-        """
-        index_created = False
-        if not self.index_enabled or self._index_ready:
-            return index_created
-
-        driver = None
-        with self._index_setup_lock:
-            if self._index_ready:
-                return index_created
-
-            driver = None
-            try:
-                connection = self._get_connection()
-                endpoint = self._driver_endpoint()
-                logger.debug(
-                    "Opening a ydb driver at %s to manage the vector index", endpoint
-                )
-                driver = ydb.Driver(
-                    endpoint=endpoint,
-                    database=self.database,
-                    credentials=self._driver_credentials(connection),
-                )
-                driver.wait(timeout=10, fail_fast=True)
-                path = self._table_path()
-                rename = [_rename_item(self._temp_index_name, self.index_name)]
-                action = _plan_index_setup(
-                    driver.table_client.describe_table(path).indexes,
-                    self.index_name,
-                    self._temp_index_name,
-                )
-                if action == _INDEX_READY:
-                    logger.info(
-                        "Vector index %s already exists; nothing to build",
-                        self.index_name,
-                    )
-                elif action == _INDEX_BUILD:
-                    logger.info(
-                        "No vector index found on %s; building it as %s",
-                        path,
-                        self._temp_index_name,
-                    )
-                    self._execute(self._add_vector_index_query(), ddl=True)
-                    logger.info(
-                        "Index %s is built; renaming it to %s",
-                        self._temp_index_name,
-                        self.index_name,
-                    )
-                    driver.table_client.alter_table(path, rename_indexes=rename)
-                    index_created = True
-                elif action == _INDEX_FINISH_TEMP:
-                    logger.warning(
-                        "Found leftover temporary index %s; renaming it to %s",
-                        self._temp_index_name,
-                        self.index_name,
-                    )
-                    try:
-                        driver.table_client.alter_table(path, rename_indexes=rename)
-                    except Exception:
-                        logger.warning(
-                            "Could not rename leftover index %s; dropping it once, "
-                            "the next query will build the index from scratch",
-                            self._temp_index_name,
-                            exc_info=True,
-                        )
-                        self._execute(self._drop_temp_index_query(), ddl=True)
-                        raise
-                    index_created = True
-            except Exception:
-                logger.error(
-                    "Vector index %s setup failed; the next query will retry "
-                    "from the current state of the table",
-                    self.index_name,
-                )
-                raise
-            finally:
-                if driver is not None:
-                    driver.stop()
-            self._index_ready = True
-            if index_created:
-                logger.info("Vector index %s created", self.index_name)
-            return index_created
+        """Return whether this call installed a vector index."""
+        return self._ensure_index(self._vector_index_setup())
 
     async def _aensure_vector_index(self) -> bool:
-        """Async variant of lazy vector-index creation."""
-        index_created = False
-        if not self.index_enabled or self._index_ready:
-            return index_created
+        return await self._aensure_index(self._vector_index_setup())
 
-        async with self._aindex_lock:
-            if self._index_ready:
-                return index_created
+    def _ensure_fulltext_index(self) -> None:
+        self._ensure_index(self._fulltext_index_setup())
 
-            driver = None
+    async def _aensure_fulltext_index(self) -> None:
+        await self._aensure_index(self._fulltext_index_setup())
+
+    @staticmethod
+    def _index_for_setup(
+        description: Any, setup: _IndexSetup, *, allow_temporary: bool = True
+    ) -> Optional[ydb.TableIndex]:
+        index = _find_index(description.indexes, setup.name)
+        if index is not None:
+            if setup.column is not None and list(index.index_columns) != [setup.column]:
+                raise ValueError(
+                    f"Index {setup.name!r} must index the {setup.column} column"
+                )
+            return index
+        if allow_temporary and setup.temporary_name is not None:
+            return _find_index(description.indexes, setup.temporary_name)
+        return None
+
+    @staticmethod
+    def _index_is_ready(
+        index: Optional[ydb.TableIndex], name: str, deadline: float
+    ) -> TypeGuard[ydb.TableIndex]:
+        if index is not None and index.status == ydb.IndexStatus.READY:
+            return True
+        if time.monotonic() >= deadline:
+            status = index.status if index is not None else None
+            status_name = status.name if status is not None else "missing"
+            raise TimeoutError(f"Index {name!r} is not ready (status: {status_name})")
+        return False
+
+    def _wait_for_index(
+        self,
+        client: Any,
+        path: str,
+        setup: _IndexSetup,
+        *,
+        allow_temporary: bool = True,
+    ) -> ydb.TableIndex:
+        deadline = time.monotonic() + DEFAULT_INDEX_READY_TIMEOUT
+        while True:
+            index = self._index_for_setup(
+                client.describe_table(path), setup, allow_temporary=allow_temporary
+            )
+            if self._index_is_ready(index, setup.name, deadline):
+                return index
+            time.sleep(0.5)
+
+    async def _await_index(
+        self,
+        client: Any,
+        path: str,
+        setup: _IndexSetup,
+        *,
+        allow_temporary: bool = True,
+    ) -> ydb.TableIndex:
+        deadline = time.monotonic() + DEFAULT_INDEX_READY_TIMEOUT
+        while True:
+            index = self._index_for_setup(
+                await client.describe_table(path),
+                setup,
+                allow_temporary=allow_temporary,
+            )
+            if self._index_is_ready(index, setup.name, deadline):
+                return index
+            await asyncio.sleep(0.5)
+
+    def _ensure_index(self, setup: _IndexSetup) -> bool:
+        """Create or reuse an index and wait until it can be queried."""
+        with self._index_setup_lock:
+            if setup.name in self._ready_indexes:
+                return False
             try:
-                connection = await self._aget_connection()
-                endpoint = self._driver_endpoint()
-                logger.debug(
-                    "Opening a ydb driver at %s to manage the vector index", endpoint
-                )
-                driver = ydb.aio.Driver(
-                    endpoint=endpoint,
-                    database=self.database,
-                    credentials=self._driver_credentials(connection),
-                )
-                await driver.wait(timeout=10, fail_fast=True)
+                connection = self._get_connection()
+                client = connection._driver.table_client
                 path = self._table_path()
-                rename = [_rename_item(self._temp_index_name, self.index_name)]
-                description = await driver.table_client.describe_table(path)
-                indexes = description.indexes
-                action = _plan_index_setup(
-                    indexes, self.index_name, self._temp_index_name
+                index = self._index_for_setup(client.describe_table(path), setup)
+                existing_temporary = (
+                    index is not None and index.name == setup.temporary_name
                 )
-                if action == _INDEX_READY:
-                    logger.info(
-                        "Vector index %s already exists; nothing to build",
-                        self.index_name,
-                    )
-                elif action == _INDEX_BUILD:
-                    logger.info(
-                        "No vector index found on %s; building it as %s",
-                        path,
-                        self._temp_index_name,
-                    )
-                    await self._aexecute(self._add_vector_index_query(), ddl=True)
-                    logger.info(
-                        "Index %s is built; renaming it to %s",
-                        self._temp_index_name,
-                        self.index_name,
-                    )
-                    await driver.table_client.alter_table(path, rename_indexes=rename)
-                    index_created = True
-                elif action == _INDEX_FINISH_TEMP:
-                    logger.warning(
-                        "Found leftover temporary index %s; renaming it to %s",
-                        self._temp_index_name,
-                        self.index_name,
-                    )
+                created = False
+                if index is None:
                     try:
-                        await driver.table_client.alter_table(
-                            path, rename_indexes=rename
+                        self._run(connection, setup.add_query, ddl=True)
+                    except ydb_dbapi.DatabaseError:
+                        # A concurrent caller may already have started the build.
+                        if (
+                            self._index_for_setup(client.describe_table(path), setup)
+                            is None
+                        ):
+                            raise
+                    else:
+                        created = setup.temporary_name is None
+
+                if index is None or index.status != ydb.IndexStatus.READY:
+                    index = self._wait_for_index(client, path, setup)
+                if index.name == setup.temporary_name:
+                    try:
+                        client.alter_table(
+                            path, rename_indexes=[_rename_item(index.name, setup.name)]
                         )
                     except Exception:
-                        logger.warning(
-                            "Could not rename leftover index %s; dropping it once, "
-                            "the next query will build the index from scratch",
-                            self._temp_index_name,
-                            exc_info=True,
+                        current = self._index_for_setup(
+                            client.describe_table(path), setup
                         )
-                        await self._aexecute(self._drop_temp_index_query(), ddl=True)
-                        raise
-                    index_created = True
+                        if current is None or current.name == setup.temporary_name:
+                            if (
+                                existing_temporary
+                                and current is not None
+                                and current.status == ydb.IndexStatus.READY
+                            ):
+                                self._run(
+                                    connection, self._drop_temp_index_query(), ddl=True
+                                )
+                            raise
+                    else:
+                        created = True
+                    self._wait_for_index(client, path, setup, allow_temporary=False)
             except Exception:
-                logger.error(
-                    "Vector index %s setup failed; the next query will retry "
-                    "from the current state of the table",
-                    self.index_name,
-                )
+                logger.error("Index %s setup failed on %s", setup.name, self.table_name)
                 raise
-            finally:
-                if driver is not None:
-                    await driver.stop()
-            self._index_ready = True
-            if index_created:
-                logger.info("Vector index %s created", self.index_name)
 
-            return index_created
+            self._ready_indexes.add(setup.name)
+            return created
+
+    async def _aensure_index(self, setup: _IndexSetup) -> bool:
+        """Async variant of lazy index setup."""
+        async with self._aindex_setup_lock:
+            if setup.name in self._ready_indexes:
+                return False
+            try:
+                connection = await self._aget_connection()
+                client = connection._driver.table_client
+                path = self._table_path()
+                index = self._index_for_setup(await client.describe_table(path), setup)
+                existing_temporary = (
+                    index is not None and index.name == setup.temporary_name
+                )
+                created = False
+                if index is None:
+                    try:
+                        await self._arun(connection, setup.add_query, ddl=True)
+                    except ydb_dbapi.DatabaseError:
+                        if (
+                            self._index_for_setup(
+                                await client.describe_table(path), setup
+                            )
+                            is None
+                        ):
+                            raise
+                    else:
+                        created = setup.temporary_name is None
+
+                if index is None or index.status != ydb.IndexStatus.READY:
+                    index = await self._await_index(client, path, setup)
+                if index.name == setup.temporary_name:
+                    try:
+                        await client.alter_table(
+                            path, rename_indexes=[_rename_item(index.name, setup.name)]
+                        )
+                    except Exception:
+                        current = self._index_for_setup(
+                            await client.describe_table(path), setup
+                        )
+                        if current is None or current.name == setup.temporary_name:
+                            if (
+                                existing_temporary
+                                and current is not None
+                                and current.status == ydb.IndexStatus.READY
+                            ):
+                                await self._arun(
+                                    connection, self._drop_temp_index_query(), ddl=True
+                                )
+                            raise
+                    else:
+                        created = True
+                    await self._await_index(client, path, setup, allow_temporary=False)
+            except Exception:
+                logger.error("Index %s setup failed on %s", setup.name, self.table_name)
+                raise
+
+            self._ready_indexes.add(setup.name)
+            return created
 
     def close(self) -> None:
         """Close the sync connection."""
@@ -913,11 +1044,17 @@ WITH (
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
         """Query the vector store."""
-        if self.index_enabled:
+        statement, params = self._prepare_search(query)
+        if query.mode != VectorStoreQueryMode.DEFAULT:
+            self._ensure_fulltext_index()
+        if query.mode == VectorStoreQueryMode.HYBRID or (
+            query.mode == VectorStoreQueryMode.DEFAULT and self.index_enabled
+        ):
             self._ensure_vector_index()
 
-        statement, params = self._prepare_search(query)
-        return _rows_to_result(self._execute(statement, params), self.strategy)
+        return _rows_to_result(
+            self._execute(statement, params), self.strategy, query.mode
+        )
 
     def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """Delete all nodes that belong to a source document."""
@@ -976,8 +1113,10 @@ WITH (
         YDB builds a replacement index and atomically switches to it.
         The existing index remains available while the replacement is built.
         """
-        if not self.index_enabled:
-            raise ValueError("Cannot rebuild vector index when index_enabled=False")
+        if not (self.index_enabled or self.hybrid_search_enabled):
+            raise ValueError(
+                "Enable vector or hybrid search to rebuild the vector index"
+            )
 
         created = self._ensure_vector_index()
 
@@ -1001,11 +1140,16 @@ WITH (
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
         """Query the vector store asynchronously."""
-        if self.index_enabled:
+        statement, params = self._prepare_search(query)
+        if query.mode != VectorStoreQueryMode.DEFAULT:
+            await self._aensure_fulltext_index()
+        if query.mode == VectorStoreQueryMode.HYBRID or (
+            query.mode == VectorStoreQueryMode.DEFAULT and self.index_enabled
+        ):
             await self._aensure_vector_index()
 
-        statement, params = self._prepare_search(query)
-        return _rows_to_result(await self._aexecute(statement, params), self.strategy)
+        rows = await self._aexecute(statement, params)
+        return _rows_to_result(rows, self.strategy, query.mode)
 
     async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
         """Delete all nodes that belong to a source document asynchronously."""
@@ -1059,8 +1203,10 @@ WITH (
 
     async def arebuild_vector_index(self) -> None:
         """Async variant of rebuild_vector_index."""
-        if not self.index_enabled:
-            raise ValueError("Cannot rebuild vector index when index_enabled=False")
+        if not (self.index_enabled or self.hybrid_search_enabled):
+            raise ValueError(
+                "Enable vector or hybrid search to rebuild the vector index"
+            )
 
         created = await self._aensure_vector_index()
 

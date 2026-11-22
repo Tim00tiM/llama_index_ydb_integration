@@ -34,7 +34,6 @@ from llama_index.vector_stores.ydb import YDBVectorStore
 from llama_index.vector_stores.ydb import base as ydb_base
 from llama_index.vector_stores.ydb.base import YDBSearchStrategy
 
-
 vector_to_bytes = ydb_base._vector_to_bytes
 bytes_to_vector = ydb_base._bytes_to_vector
 
@@ -384,10 +383,8 @@ def test_prepare_search_ok_and_empty_ids_are_not_a_restriction():
 @pytest.mark.parametrize(
     "mode",
     [
-        VectorStoreQueryMode.HYBRID,
-        VectorStoreQueryMode.TEXT_SEARCH,
-        VectorStoreQueryMode.SPARSE,
         VectorStoreQueryMode.MMR,
+        VectorStoreQueryMode.SEMANTIC_HYBRID,
     ],
 )
 def test_prepare_search_rejects_unsupported_modes(mode):
@@ -405,6 +402,91 @@ def test_prepare_search_checks_dimension():
     q = VectorStoreQuery(query_embedding=[1.0, 0.0])
     with pytest.raises(ValueError, match="embed_dim"):
         _offline_store()._prepare_search(q)
+
+
+@pytest.mark.parametrize(
+    "mode", [VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.SPARSE]
+)
+def test_prepare_fulltext_search_without_embedding(mode):
+    store = _offline_store(fulltext_index_enabled=True)
+    query = VectorStoreQuery(
+        mode=mode, query_str="Оплата E104", similarity_top_k=3, sparse_top_k=5
+    )
+    statement, params = store._prepare_search(query)
+    assert "VIEW `llamaindex_fulltext_index`" in statement
+    assert "WHERE FulltextScore(`text`, $query_text) > 0" in statement
+    assert "LIMIT 5;" in statement
+    assert params == {"$query_text": ("Оплата E104", ydb_base.ydb.PrimitiveType.Utf8)}
+
+
+def test_prepare_hybrid_query_uses_weights_and_limits():
+    store = _offline_store(
+        index_enabled=True,
+        fulltext_index_enabled=True,
+        hybrid_search_enabled=True,
+        fulltext_index_name="text_idx",
+        index_name="dense_idx",
+        index_tree_search_top_size=6,
+    )
+    query = VectorStoreQuery(
+        mode=VectorStoreQueryMode.HYBRID,
+        query_str="Оплата E104",
+        query_embedding=[1.0, 0.0, 0.0],
+        similarity_top_k=12,
+        sparse_top_k=8,
+        hybrid_top_k=4,
+        alpha=0.75,
+    )
+    statement, params = store._prepare_search(query)
+    assert 'PRAGMA ydb.KMeansTreeSearchTopSize="6"' in statement
+    assert "(0.25, 0.75) AS Weights" in statement
+    assert '("text_idx", "dense_idx") AS Indexes' in statement
+    assert "(8, 12) AS Limits" in statement
+    assert "LIMIT 4;" in statement
+    assert set(params) == {"$query_text", "$embedding"}
+
+
+@pytest.mark.parametrize(
+    ("mode", "flag"),
+    [
+        (VectorStoreQueryMode.TEXT_SEARCH, "fulltext_index_enabled"),
+        (VectorStoreQueryMode.HYBRID, "hybrid_search_enabled"),
+    ],
+)
+def test_search_requires_explicit_enablement(mode, flag):
+    store = _offline_store(index_enabled=True)
+    with pytest.raises(ValueError, match=flag):
+        store.query(VectorStoreQuery(mode=mode))
+    assert store.client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("index_enabled", "fulltext_index_enabled"),
+    [(False, True), (True, False), (False, False)],
+)
+async def test_hybrid_search_requires_both_indexes_enabled(
+    index_enabled, fulltext_index_enabled
+):
+    store = _offline_store(
+        index_enabled=index_enabled,
+        fulltext_index_enabled=fulltext_index_enabled,
+        hybrid_search_enabled=True,
+    )
+    query = VectorStoreQuery(
+        mode=VectorStoreQueryMode.HYBRID,
+        query_str="between",
+        query_embedding=[1.0, 0.0, 0.0],
+    )
+    message = (
+        "Hybrid search requires index_enabled=True and fulltext_index_enabled=True"
+    )
+    with pytest.raises(ValueError, match=message):
+        store.query(query)
+    with pytest.raises(ValueError, match=message):
+        await store.aquery(query)
+    assert store.client is None
+    assert store._aconnection is None
 
 
 # Not implemented yet: these tests document the current behavior. When filters /
@@ -461,6 +543,9 @@ def test_to_dict_from_dict_roundtrip():
         index_name="idx_ser",
         index_tree_search_top_size=3,
         strategy=YDBSearchStrategy.COSINE_DISTANCE,
+        fulltext_index_enabled=True,
+        fulltext_index_name="idx_text_ser",
+        hybrid_search_enabled=True,
     )
     data = store.to_dict()
     assert "credentials" not in data  # secrets are never serialized
@@ -488,56 +573,10 @@ def test_default_search_top_size_does_not_emit_pragma():
     assert "PRAGMA" not in query
 
 
-# ---- credentials for the index-management driver ----------------------------
-
-
-def _connection_with_credentials(credentials: Any) -> Any:
-    driver = SimpleNamespace(_driver_config=SimpleNamespace(credentials=credentials))
-    return SimpleNamespace(_driver=driver)
-
-
-def test_driver_credentials_prefers_normalized_connection_credentials():
-    normalized = object()
-    store = _offline_store(credentials={"token": "secret"})
-    assert (
-        store._driver_credentials(_connection_with_credentials(normalized))
-        is normalized
-    )
-
-
-def test_driver_credentials_rejects_raw_dict_without_normalized_object():
-    store = _offline_store(credentials={"token": "secret"})
-    with pytest.raises(RuntimeError, match="normalized credentials"):
-        store._driver_credentials(_connection_with_credentials(None))
-
-
-def test_driver_credentials_anonymous_stays_none():
-    store = _offline_store()
-    assert store._driver_credentials(_connection_with_credentials(None)) is None
-
-
-# ---- index setup planning ----------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("names", "expected"),
-    [
-        ([], "build"),
-        (["other"], "build"),
-        (["idx__temp"], "finish_temp"),
-        (["idx"], "ready"),
-        (["idx", "idx__temp"], "ready"),
-    ],
-)
-def test_plan_index_setup(names, expected):
-    indexes = [SimpleNamespace(name=n) for n in names]
-    assert ydb_base._plan_index_setup(indexes, "idx", "idx__temp") == expected
-
-
 # ---- lazy index creation with fakes ------------------------------------------
 
 _FINAL, _TEMP = "idx", "idx__temp"
-_NORMALIZED = object()
+_FULLTEXT = "text_idx"
 
 
 class _IndexWorld:
@@ -547,13 +586,14 @@ class _IndexWorld:
         self.indexes = list(indexes)
         self.ddl: list = []
         self.rename_failures = 0
-        self.driver_fails = False
-        self.driver_credentials: Any = None
+        self.connection_fails = False
+        self.connection_credentials: Any = None
+        self.statuses: dict[str, ydb_base.ydb.IndexStatus] = {}
 
     def apply_ddl(self, query: str) -> None:
         if "ADD INDEX" in query:
             self.ddl.append("ADD")
-            self.indexes.append(_TEMP)
+            self.indexes.append(_FULLTEXT if "fulltext_relevance" in query else _TEMP)
         elif "DROP INDEX" in query:
             self.ddl.append("DROP")
             self.indexes.remove(_TEMP)
@@ -569,7 +609,16 @@ class _IndexWorld:
             self.indexes.append(item.destination_name)
 
     def describe(self) -> Any:
-        return SimpleNamespace(indexes=[SimpleNamespace(name=n) for n in self.indexes])
+        return SimpleNamespace(
+            indexes=[
+                SimpleNamespace(
+                    name=name,
+                    status=self.statuses.get(name, ydb_base.ydb.IndexStatus.READY),
+                    index_columns=["text"] if name == _FULLTEXT else ["embedding"],
+                )
+                for name in self.indexes
+            ]
+        )
 
 
 class _Cursor:
@@ -608,9 +657,23 @@ class _Connection:
     def __init__(self, world: _IndexWorld, asynchronous: bool = False) -> None:
         self._world = world
         self._asynchronous = asynchronous
-        self._driver = SimpleNamespace(
-            _driver_config=SimpleNamespace(credentials=_NORMALIZED)
-        )
+        if asynchronous:
+
+            async def describe_table(path: str) -> Any:
+                return world.describe()
+
+            async def alter_table(path: str, rename_indexes: Any) -> None:
+                world.rename(rename_indexes)
+
+            client = SimpleNamespace(
+                describe_table=describe_table, alter_table=alter_table
+            )
+        else:
+            client = SimpleNamespace(
+                describe_table=lambda path: world.describe(),
+                alter_table=lambda path, rename_indexes: world.rename(rename_indexes),
+            )
+        self._driver = SimpleNamespace(table_client=client)
 
     def cursor(self) -> Any:
         return (_AsyncCursor if self._asynchronous else _Cursor)(self._world)
@@ -619,61 +682,27 @@ class _Connection:
         pass
 
 
-class _Driver:
-    world: _IndexWorld
-
-    def __init__(self, endpoint: str, database: str, credentials: Any) -> None:
-        if self.world.driver_fails:
-            raise RuntimeError("driver creation failed")
-        self.world.driver_credentials = credentials
-        self.table_client = SimpleNamespace(
-            describe_table=lambda path: self.world.describe(),
-            alter_table=lambda path, rename_indexes: self.world.rename(rename_indexes),
-        )
-
-    def wait(self, **kwargs: Any) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-
-class _AsyncDriver:
-    world: _IndexWorld
-
-    def __init__(self, endpoint: str, database: str, credentials: Any) -> None:
-        if self.world.driver_fails:
-            raise RuntimeError("driver creation failed")
-        self.world.driver_credentials = credentials
-
-        async def describe_table(path: str) -> Any:
-            return self.world.describe()
-
-        async def alter_table(path: str, rename_indexes: Any) -> None:
-            self.world.rename(rename_indexes)
-
-        self.table_client = SimpleNamespace(
-            describe_table=describe_table, alter_table=alter_table
-        )
-
-    async def wait(self, **kwargs: Any) -> None:
-        pass
-
-    async def stop(self) -> None:
-        pass
-
-
 def _setup_world(monkeypatch: Any, world: _IndexWorld) -> YDBVectorStore:
-    """A store wired to fake connections and drivers that share ``world``."""
-    _Driver.world = world
-    _AsyncDriver.world = world
-    monkeypatch.setattr(ydb_base.ydb, "Driver", _Driver)
-    monkeypatch.setattr(ydb_base.ydb.aio, "Driver", _AsyncDriver)
-    store = _offline_store(
-        index_enabled=True, index_name=_FINAL, credentials={"token": "secret"}
+    """A store wired to fake DB-API connections that share ``world``."""
+
+    def connect(*, asynchronous: bool = False, **kwargs: Any) -> _Connection:
+        if world.connection_fails:
+            raise RuntimeError("connection creation failed")
+        world.connection_credentials = kwargs["credentials"]
+        return _Connection(world, asynchronous=asynchronous)
+
+    async def async_connect(**kwargs: Any) -> _Connection:
+        return connect(asynchronous=True, **kwargs)
+
+    monkeypatch.setattr(ydb_dbapi, "connect", connect)
+    monkeypatch.setattr(ydb_dbapi, "async_connect", async_connect)
+    return _offline_store(
+        index_enabled=True,
+        index_name=_FINAL,
+        fulltext_index_enabled=True,
+        fulltext_index_name=_FULLTEXT,
+        credentials={"token": "secret"},
     )
-    store._connection = _Connection(world)
-    return store
 
 
 def test_ensure_vector_index_builds_missing_index(monkeypatch):
@@ -685,21 +714,22 @@ def test_ensure_vector_index_builds_missing_index(monkeypatch):
     assert world.indexes == [_FINAL]
 
 
-def test_ensure_vector_index_gives_ydb_driver_normalized_credentials(monkeypatch):
+def test_ensure_vector_index_uses_dbapi_connection_with_credentials_dict(monkeypatch):
     world = _IndexWorld()
     store = _setup_world(monkeypatch, world)  # credentials are a dict
 
     store._ensure_vector_index()
-    assert world.driver_credentials is _NORMALIZED
+    assert world.connection_credentials == {"token": "secret"}
 
 
-def test_ensure_vector_index_reuses_existing_index(monkeypatch):
-    world = _IndexWorld(_FINAL)
+@pytest.mark.parametrize("leftover", [(), (_TEMP,)])
+def test_ensure_vector_index_reuses_existing_index(monkeypatch, leftover):
+    world = _IndexWorld(_FINAL, *leftover)
     store = _setup_world(monkeypatch, world)
 
     assert store._ensure_vector_index() is False
     assert world.ddl == []
-    assert store._index_ready is True
+    assert _FINAL in store._ready_indexes
 
 
 def test_ensure_vector_index_finishes_leftover_temp_index(monkeypatch):
@@ -734,42 +764,39 @@ def test_ensure_vector_index_drops_unrenamable_leftover_once(monkeypatch):
         store._ensure_vector_index()
     assert world.ddl == ["DROP"]  # dropped once, not rebuilt in the same call
     assert world.indexes == []
-    assert store._index_ready is False
+    assert _FINAL not in store._ready_indexes
 
     assert store._ensure_vector_index() is True  # the next call builds from scratch
     assert world.ddl == ["DROP", "ADD"]
     assert world.indexes == [_FINAL]
 
 
-def test_ensure_vector_index_driver_failure_logs_and_changes_nothing(
+def test_ensure_vector_index_connection_failure_logs_and_changes_nothing(
     monkeypatch, caplog
 ):
     world = _IndexWorld()
-    world.driver_fails = True
+    world.connection_fails = True
     store = _setup_world(monkeypatch, world)
 
     with caplog.at_level(logging.INFO):
-        with pytest.raises(RuntimeError, match="driver creation failed"):
+        with pytest.raises(RuntimeError, match="connection creation failed"):
             store._ensure_vector_index()
     assert any("setup failed" in r.getMessage() for r in caplog.records)
     assert world.ddl == []
     assert world.indexes == []
 
-    world.driver_fails = False
+    world.connection_fails = False
     assert store._ensure_vector_index() is True
 
 
-def test_async_ensure_vector_index_builds_with_normalized_credentials(monkeypatch):
+def test_async_ensure_vector_index_uses_dbapi_connection_with_credentials_dict(
+    monkeypatch,
+):
     world = _IndexWorld()
     store = _setup_world(monkeypatch, world)
 
-    async def run() -> bool:
-        store._aconnection = _Connection(world, asynchronous=True)
-        store._aloop = asyncio.get_running_loop()
-        return await store._aensure_vector_index()
-
-    assert asyncio.run(run()) is True
-    assert world.driver_credentials is _NORMALIZED
+    assert asyncio.run(store._aensure_vector_index()) is True
+    assert world.connection_credentials == {"token": "secret"}
     assert world.indexes == [_FINAL]
 
 
@@ -779,8 +806,6 @@ def test_async_ensure_vector_index_drops_unrenamable_leftover_once(monkeypatch):
     store = _setup_world(monkeypatch, world)
 
     async def run() -> None:
-        store._aconnection = _Connection(world, asynchronous=True)
-        store._aloop = asyncio.get_running_loop()
         with pytest.raises(RuntimeError):
             await store._aensure_vector_index()
         assert world.ddl == ["DROP"]
@@ -789,6 +814,77 @@ def test_async_ensure_vector_index_drops_unrenamable_leftover_once(monkeypatch):
     asyncio.run(run())
     assert world.ddl == ["DROP", "ADD"]
     assert world.indexes == [_FINAL]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("index_name", [_FINAL, _TEMP, _FULLTEXT])
+async def test_ensure_index_waits_for_building_index(
+    monkeypatch, asynchronous, index_name
+):
+    world = _IndexWorld(index_name)
+    world.statuses[index_name] = ydb_base.ydb.IndexStatus.BUILDING
+    store = _setup_world(monkeypatch, world)
+    final_name = _FULLTEXT if index_name == _FULLTEXT else _FINAL
+
+    def finish_build(_delay: float) -> None:
+        assert final_name not in store._ready_indexes
+        assert world.indexes == [index_name]
+        world.statuses[index_name] = ydb_base.ydb.IndexStatus.READY
+
+    async def afinish_build(delay: float) -> None:
+        finish_build(delay)
+
+    if asynchronous:
+        monkeypatch.setattr(ydb_base.asyncio, "sleep", afinish_build)
+        if index_name == _FULLTEXT:
+            await store._aensure_fulltext_index()
+        else:
+            assert await store._aensure_vector_index() is (index_name == _TEMP)
+    else:
+        monkeypatch.setattr(ydb_base.time, "sleep", finish_build)
+        if index_name == _FULLTEXT:
+            store._ensure_fulltext_index()
+        else:
+            assert store._ensure_vector_index() is (index_name == _TEMP)
+
+    assert world.statuses[index_name] == ydb_base.ydb.IndexStatus.READY
+    assert world.indexes == [final_name]
+    assert world.ddl == []
+    assert final_name in store._ready_indexes
+
+
+def test_ensure_vector_index_timeout_allows_retry(monkeypatch):
+    world = _IndexWorld(_FINAL)
+    world.statuses[_FINAL] = ydb_base.ydb.IndexStatus.BUILDING
+    store = _setup_world(monkeypatch, world)
+    monkeypatch.setattr(ydb_base, "DEFAULT_INDEX_READY_TIMEOUT", 0)
+
+    with pytest.raises(TimeoutError, match="Index 'idx' is not ready .*BUILDING"):
+        store._ensure_vector_index()
+    assert _FINAL not in store._ready_indexes
+    assert world.ddl == []
+
+    world.statuses[_FINAL] = ydb_base.ydb.IndexStatus.READY
+    assert store._ensure_vector_index() is False
+    assert _FINAL in store._ready_indexes
+
+
+def test_ensure_vector_index_reuses_index_renamed_by_another_caller(monkeypatch):
+    world = _IndexWorld(_TEMP)
+    store = _setup_world(monkeypatch, world)
+    rename = world.rename
+
+    def rename_concurrently(items: Any) -> None:
+        rename(items)
+        raise RuntimeError("temporary index no longer exists")
+
+    monkeypatch.setattr(world, "rename", rename_concurrently)
+
+    assert store._ensure_vector_index() is False
+    assert world.indexes == [_FINAL]
+    assert world.ddl == []
+    assert _FINAL in store._ready_indexes
 
 
 ##########################################
@@ -1017,9 +1113,7 @@ def test_query_wrong_dimension(make_store):
 
 def test_query_unsupported_mode(make_store):
     store = make_store()
-    q = VectorStoreQuery(
-        query_embedding=[1.0, 0.0, 0.0], mode=VectorStoreQueryMode.HYBRID
-    )
+    q = VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0], mode=VectorStoreQueryMode.MMR)
     with pytest.raises(NotImplementedError):
         store.query(q)
 
@@ -1221,6 +1315,72 @@ def test_sync_and_async_see_the_same_data(make_store):
     asyncio.run(store.async_add(_axis_nodes()))
     assert _count(store) == 4
     assert store.query(_q([1.0, 0.0, 0.0], k=1)).ids == ["x"]
+
+
+def test_fulltext_search_scores_existing_and_updated_nodes(make_store):
+    store = make_store(
+        fulltext_index_enabled=True, strategy=YDBSearchStrategy.COSINE_DISTANCE
+    )
+    store.add(_axis_nodes())
+    query = VectorStoreQuery(mode=VectorStoreQueryMode.TEXT_SEARCH, query_str="BETWEEN")
+    result = store.query(query)
+    assert result.ids == ["xy"]
+    assert result.nodes[0].get_content() == "between"
+    assert result.similarities[0] > 0
+
+    store.delete_nodes(["xy"])
+    reopened = make_store(table_name=store.table_name, fulltext_index_enabled=True)
+    assert reopened.query(query).ids == []
+
+
+def test_hybrid_retriever_preserves_database_order_without_scores(make_store):
+    store = make_store(
+        index_enabled=True, fulltext_index_enabled=True, hybrid_search_enabled=True
+    )
+    store.add(_axis_nodes())
+    index = VectorStoreIndex.from_vector_store(
+        store, embed_model=MockEmbedding(embed_dim=3)
+    )
+    retriever = index.as_retriever(
+        vector_store_query_mode="hybrid",
+        similarity_top_k=4,
+        sparse_top_k=1,
+        hybrid_top_k=1,
+        alpha=0.25,
+    )
+    found = retriever.retrieve("between")
+    assert [result.node.node_id for result in found] == ["xy"]
+    assert found[0].score is None
+
+
+@pytest.mark.asyncio
+async def test_async_hybrid_search_combines_lexical_and_vector_candidates(make_store):
+    store = make_store(
+        index_enabled=True, fulltext_index_enabled=True, hybrid_search_enabled=True
+    )
+    async with _aclosing(store):
+        await store.async_add(_axis_nodes())
+        result = await store.aquery(
+            VectorStoreQuery(
+                mode=VectorStoreQueryMode.HYBRID,
+                query_str="between",
+                query_embedding=[1.0, 0.0, 0.0],
+                similarity_top_k=1,
+                sparse_top_k=1,
+                hybrid_top_k=2,
+                alpha=0.75,
+            )
+        )
+        assert result.ids == ["x", "xy"]
+        assert result.similarities is None
+
+        index = VectorStoreIndex.from_vector_store(
+            store, embed_model=MockEmbedding(embed_dim=3)
+        )
+        retriever = index.as_retriever(vector_store_query_mode="text_search")
+        found = await retriever.aretrieve("between")
+        assert [result.node.node_id for result in found] == ["xy"]
+        assert found[0].score > 0
 
 
 # ---- LlamaIndex end to end -------------------------------------------------
